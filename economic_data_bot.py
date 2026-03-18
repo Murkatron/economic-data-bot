@@ -54,7 +54,7 @@ def fred_observations(api_key: str, series_id: str, limit: int = 24) -> List[Poi
         "api_key": api_key,
         "file_type": "json",
         "series_id": series_id,
-        "sort_order": "asc",
+        "sort_order": "desc",
         "limit": limit,
     }
 
