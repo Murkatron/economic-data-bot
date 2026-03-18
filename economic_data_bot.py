@@ -108,13 +108,6 @@ COMMODITY_META = {
         "suffix": "",
         "function": "BRENT",
     },
-    "gold": {
-        "name": "Gold",
-        "cadence": "Daily",
-        "prefix": "$",
-        "suffix": "",
-        "function": "GOLD",
-    },
 }
 
 ALL_KEYS = [
@@ -129,7 +122,6 @@ ALL_KEYS = [
     "wti",
     "brent",
     "sp500",
-    "gold",
     "debt",
 ]
 
@@ -141,7 +133,7 @@ FIELDNAMES = (
 
 MACRO_KEYS = ["gdp", "unemployment", "cpi", "fedfunds", "ust10y", "sentiment"]
 COST_KEYS = ["mortgage", "gas", "wti", "brent"]
-MARKET_KEYS = ["sp500", "gold", "debt"]
+MARKET_KEYS = ["sp500", "debt"]
 
 DISPLAY_GROUPS = [
     ("Economic Snapshot — Macro", MACRO_KEYS, "macro_trends.png"),
@@ -439,8 +431,6 @@ def build_embed_rows(data: Dict[str, Point], history_rows: List[Dict[str, str]],
         point = data[key]
 
         latest, delta = latest_change_from_history(history_rows, key)
-        arrow = trend_arrow(delta)
-
         latest_text = fmt_num(point.value, prefix=meta["prefix"], suffix=meta["suffix"])
 
         if delta is None:
@@ -448,7 +438,7 @@ def build_embed_rows(data: Dict[str, Point], history_rows: List[Dict[str, str]],
         elif delta == 0:
             trend_text = "flat"
         else:
-            trend_text = f"{arrow} {fmt_num(abs(delta), prefix=meta['prefix'], suffix=meta['suffix'])}"
+            trend_text = f"{trend_arrow(delta)} {fmt_num(abs(delta), prefix=meta['prefix'], suffix=meta['suffix'])}"
 
         rows.append({
             "name": f"{meta['name']} ({meta['cadence']})",
@@ -470,13 +460,12 @@ def build_summary(history_rows: List[Dict[str, str]], keys: List[str]) -> str:
             continue
 
         latest_text = fmt_num(latest, prefix=meta["prefix"], suffix=meta["suffix"])
-        arrow = trend_arrow(delta)
 
         if delta is None or delta == 0:
             bits.append(f"{meta['name']}: {latest_text} flat")
         else:
             delta_text = fmt_num(abs(delta), prefix=meta["prefix"], suffix=meta["suffix"])
-            bits.append(f"{meta['name']}: {latest_text} {arrow} {delta_text}")
+            bits.append(f"{meta['name']}: {latest_text} {trend_arrow(delta)} {delta_text}")
 
     return " • ".join(bits) if bits else "Daily update posted."
 
@@ -529,19 +518,20 @@ def main() -> int:
     for key, meta in FRED_SERIES.items():
         data[key] = fred_latest_observation(fred_key, meta["series_id"])
 
-    # Space out Alpha Vantage requests to reduce free-tier throttling
     data["wti"] = alpha_commodity_latest(alpha_key, COMMODITY_META["wti"]["function"])
     time.sleep(20)
     data["brent"] = alpha_commodity_latest(alpha_key, COMMODITY_META["brent"]["function"])
-    time.sleep(20)
-    data["gold"] = alpha_commodity_latest(alpha_key, COMMODITY_META["gold"]["function"])
 
     history_rows = fetch_history_from_github(github_repo, github_branch, github_token)
     history_rows = upsert_today_snapshot(history_rows, data)
     push_history_to_github(github_repo, github_branch, github_token, history_rows)
 
     for title, keys, filename in DISPLAY_GROUPS:
-        chart = make_chart(history_rows, keys, title.replace("Economic Snapshot — ", "") + " Trends (Normalized, base = 100)")
+        chart = make_chart(
+            history_rows,
+            keys,
+            title.replace("Economic Snapshot — ", "") + " Trends (Normalized, base = 100)"
+        )
         rows = build_embed_rows(data, history_rows, keys)
         summary = build_summary(history_rows, keys)
         payload = discord_payload(rows, summary, title, filename)
