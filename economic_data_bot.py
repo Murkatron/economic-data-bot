@@ -19,7 +19,6 @@ ALPHA_BASE = "https://www.alphavantage.co/query"
 TIMEOUT = 30
 HISTORY_FILE = "history.csv"
 
-# FRED series IDs
 FRED_SERIES = {
     "gdp": {
         "series_id": "GDPC1",
@@ -429,8 +428,7 @@ def build_embed_rows(data: Dict[str, Point], history_rows: List[Dict[str, str]],
     for key in keys:
         meta = metric_meta(key)
         point = data[key]
-
-        latest, delta = latest_change_from_history(history_rows, key)
+        _, delta = latest_change_from_history(history_rows, key)
         latest_text = fmt_num(point.value, prefix=meta["prefix"], suffix=meta["suffix"])
 
         if delta is None:
@@ -470,8 +468,46 @@ def build_summary(history_rows: List[Dict[str, str]], keys: List[str]) -> str:
     return " • ".join(bits) if bits else "Daily update posted."
 
 
-def discord_payload(rows: List[Dict[str, str]], summary: str, title: str, image_name: str) -> dict:
-    description_parts = [f"**Summary**\n{summary}"]
+def build_changes_breakdown(history_rows: List[Dict[str, str]], keys: List[str]) -> str:
+    if len(history_rows) < 2:
+        return "No prior run to compare yet."
+
+    current = history_rows[-1]
+    previous = history_rows[-2]
+    lines: List[str] = []
+
+    for key in keys:
+        meta = metric_meta(key)
+        curr = parse_float(current.get(key))
+        prev = parse_float(previous.get(key))
+
+        if curr is None or prev is None:
+            lines.append(f"{meta['name']}: n/a")
+            continue
+
+        delta = curr - prev
+
+        if delta == 0:
+            lines.append(f"{meta['name']} ➡️ No change")
+        else:
+            arrow = "📈" if delta > 0 else "📉"
+            delta_text = fmt_num(abs(delta), prefix=meta["prefix"], suffix=meta["suffix"])
+            lines.append(f"{meta['name']} {arrow} {delta_text}")
+
+    return "\n".join(lines)
+
+
+def discord_payload(
+    rows: List[Dict[str, str]],
+    summary: str,
+    title: str,
+    image_name: str,
+    changes_breakdown: str,
+) -> dict:
+    description_parts = [
+        f"**Summary**\n{summary}",
+        f"**Changes Since Last Run**\n{changes_breakdown}",
+    ]
 
     for item in rows:
         description_parts.append(
@@ -534,7 +570,8 @@ def main() -> int:
         )
         rows = build_embed_rows(data, history_rows, keys)
         summary = build_summary(history_rows, keys)
-        payload = discord_payload(rows, summary, title, filename)
+        changes_breakdown = build_changes_breakdown(history_rows, keys)
+        payload = discord_payload(rows, summary, title, filename, changes_breakdown)
         post_to_discord_single(webhook, payload, chart, filename)
 
     print("Posted economic snapshot to Discord.")
