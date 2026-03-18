@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
 """
-Economic Data Discord Webhook Poster
-Sources:
-- FRED (GDP, CPI, Unemployment, Fed Funds Rate)
-- Alpha Vantage (WTI and Brent crude)
+Simple Economic Data Discord Webhook Poster
+
+Tracks:
+- Real GDP (Quarterly)            -> FRED GDPC1
+- Unemployment (Monthly)          -> FRED UNRATE
+- Inflation / CPI (Monthly)       -> FRED CPIAUCSL
+- Mortgage Rate (Weekly)          -> FRED MORTGAGE30US
+- Gas Price (Weekly)              -> FRED GASREGW
+- WTI Oil (Daily-ish market data) -> Alpha Vantage WTI commodity endpoint
+
+What it does:
+1. Fetch latest values
+2. Save one snapshot per day into history.csv
+3. Build a trend chart from that saved history
+4. Post an embed + chart to Discord webhook
 
 Environment variables:
     DISCORD_WEBHOOK_URL=...
@@ -13,13 +24,14 @@ Environment variables:
 
 from __future__ import annotations
 
+import csv
 import io
 import json
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from datetime import date, datetime, timezone
+from typing import Dict, List, Optional
 
 import matplotlib.pyplot as plt
 import requests
@@ -27,12 +39,55 @@ import requests
 FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
 ALPHA_BASE = "https://www.alphavantage.co/query"
 TIMEOUT = 30
+HISTORY_FILE = "history.csv"
 
-SERIES = {
-    "GDP": {"series_id": "GDPC1", "label": "Real GDP"},
-    "CPI": {"series_id": "CPIAUCSL", "label": "CPI"},
-    "UNRATE": {"series_id": "UNRATE", "label": "Unemployment"},
-    "FEDFUNDS": {"series_id": "FEDFUNDS", "label": "Fed Funds"},
+FRED_SERIES = {
+    "gdp": {
+        "series_id": "GDPC1",
+        "name": "Real GDP",
+        "cadence": "Quarterly",
+        "prefix": "",
+        "suffix": "",
+    },
+    "unemployment": {
+        "series_id": "UNRATE",
+        "name": "Unemployment",
+        "cadence": "Monthly",
+        "prefix": "",
+        "suffix": "%",
+    },
+    "cpi": {
+        "series_id": "CPIAUCSL",
+        "name": "Inflation / CPI",
+        "cadence": "Monthly",
+        "prefix": "",
+        "suffix": "",
+    },
+    "mortgage": {
+        "series_id": "MORTGAGE30US",
+        "name": "Mortgage Rate",
+        "cadence": "Weekly",
+        "prefix": "",
+        "suffix": "%",
+    },
+    "gas": {
+        "series_id": "GASREGW",
+        "name": "Gas Price",
+        "cadence": "Weekly",
+        "prefix": "$",
+        "suffix": "",
+    },
+}
+
+DISPLAY_ORDER = ["gdp", "unemployment", "cpi", "mortgage", "gas", "wti"]
+
+DISPLAY_META = {
+    "wti": {
+        "name": "WTI Oil",
+        "cadence": "Daily",
+        "prefix": "$",
+        "suffix": "",
+    }
 }
 
 
@@ -49,13 +104,23 @@ def require_env(name: str) -> str:
     return value
 
 
-def fred_observations(api_key: str, series_id: str, limit: int = 24) -> List[Point]:
+def fmt_num(val: Optional[float], prefix: str = "", suffix: str = "") -> str:
+    if val is None:
+        return "n/a"
+    if abs(val) >= 1000:
+        return f"{prefix}{val:,.1f}{suffix}"
+    if abs(val) >= 100:
+        return f"{prefix}{val:,.1f}{suffix}"
+    return f"{prefix}{val:,.2f}{suffix}"
+
+
+def fred_latest_observation(api_key: str, series_id: str) -> Point:
     params = {
         "api_key": api_key,
         "file_type": "json",
         "series_id": series_id,
         "sort_order": "desc",
-        "limit": limit,
+        "limit": 1,
     }
 
     last_error = None
@@ -65,22 +130,15 @@ def fred_observations(api_key: str, series_id: str, limit: int = 24) -> List[Poi
             r.raise_for_status()
             payload = r.json()
 
-            out: List[Point] = []
-            for obs in payload.get("observations", []):
+            observations = payload.get("observations", [])
+            for obs in observations:
                 value = obs.get("value")
-                if value in (".", None, ""):
+                if value in (".", "", None):
                     continue
-                try:
-                    dt = datetime.strptime(obs["date"], "%Y-%m-%d")
-                    out.append(Point(date=dt, value=float(value)))
-                except Exception:
-                    continue
+                dt = datetime.strptime(obs["date"], "%Y-%m-%d")
+                return Point(date=dt, value=float(value))
 
-            if not out:
-                raise RuntimeError(f"No usable data returned for FRED series {series_id}")
-
-            return out
-
+            raise RuntimeError(f"No usable data returned for FRED series {series_id}")
         except Exception as e:
             last_error = e
             time.sleep(2 * (attempt + 1))
@@ -88,10 +146,10 @@ def fred_observations(api_key: str, series_id: str, limit: int = 24) -> List[Poi
     raise RuntimeError(f"FRED failed for {series_id}: {last_error}")
 
 
-def alpha_commodity(api_key: str, symbol: str, interval: str = "monthly") -> List[Point]:
+def alpha_wti_latest(api_key: str) -> Point:
     params = {
-        "function": symbol,
-        "interval": interval,
+        "function": "WTI",
+        "interval": "daily",
         "apikey": api_key,
     }
 
@@ -105,97 +163,182 @@ def alpha_commodity(api_key: str, symbol: str, interval: str = "monthly") -> Lis
             series = payload.get("data", [])
             if not isinstance(series, list) or not series:
                 note = payload.get("Note") or payload.get("Information") or payload.get("Error Message")
-
                 if note and "Please consider spreading out your free API requests" in str(note):
                     time.sleep(15)
                     continue
+                raise RuntimeError(f"Unexpected Alpha Vantage response: {note or payload}")
 
-                raise RuntimeError(f"Unexpected Alpha Vantage response for {symbol}: {note or payload}")
-
-            out: List[Point] = []
+            valid_rows = []
             for item in series:
                 value = item.get("value")
-                if value in (".", None, ""):
+                if value in (".", "", None):
                     continue
                 try:
                     dt = datetime.strptime(item["date"], "%Y-%m-%d")
-                    out.append(Point(date=dt, value=float(value)))
+                    valid_rows.append(Point(date=dt, value=float(value)))
                 except Exception:
                     continue
 
-            out.sort(key=lambda p: p.date)
-            if not out:
-                raise RuntimeError(f"No usable data returned for Alpha Vantage commodity {symbol}")
+            if not valid_rows:
+                raise RuntimeError("No usable data returned for WTI")
 
-            return out
-
+            valid_rows.sort(key=lambda p: p.date)
+            return valid_rows[-1]
         except Exception as e:
             last_error = e
             time.sleep(15)
 
-    raise RuntimeError(f"Alpha Vantage failed for {symbol}: {last_error}")
+    raise RuntimeError(f"Alpha Vantage WTI failed: {last_error}")
 
 
-def latest_and_prev(points: List[Point]) -> Tuple[Point, Optional[Point]]:
-    if not points:
-        raise RuntimeError("No points available")
-    if len(points) == 1:
-        return points[-1], None
-    return points[-1], points[-2]
+def ensure_history_file() -> None:
+    if os.path.exists(HISTORY_FILE):
+        return
+
+    with open(HISTORY_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "snapshot_date",
+            "gdp",
+            "gdp_updated",
+            "unemployment",
+            "unemployment_updated",
+            "cpi",
+            "cpi_updated",
+            "mortgage",
+            "mortgage_updated",
+            "gas",
+            "gas_updated",
+            "wti",
+            "wti_updated",
+        ])
 
 
-def pct_change(new: float, old: float) -> Optional[float]:
-    if old == 0:
+def load_history() -> List[Dict[str, str]]:
+    ensure_history_file()
+    rows: List[Dict[str, str]] = []
+
+    with open(HISTORY_FILE, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(row)
+
+    return rows
+
+
+def save_history(rows: List[Dict[str, str]]) -> None:
+    fieldnames = [
+        "snapshot_date",
+        "gdp",
+        "gdp_updated",
+        "unemployment",
+        "unemployment_updated",
+        "cpi",
+        "cpi_updated",
+        "mortgage",
+        "mortgage_updated",
+        "gas",
+        "gas_updated",
+        "wti",
+        "wti_updated",
+    ]
+
+    with open(HISTORY_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def upsert_today_snapshot(data: Dict[str, Point]) -> List[Dict[str, str]]:
+    rows = load_history()
+    today = date.today().isoformat()
+
+    snapshot = {
+        "snapshot_date": today,
+        "gdp": str(data["gdp"].value),
+        "gdp_updated": data["gdp"].date.strftime("%Y-%m-%d"),
+        "unemployment": str(data["unemployment"].value),
+        "unemployment_updated": data["unemployment"].date.strftime("%Y-%m-%d"),
+        "cpi": str(data["cpi"].value),
+        "cpi_updated": data["cpi"].date.strftime("%Y-%m-%d"),
+        "mortgage": str(data["mortgage"].value),
+        "mortgage_updated": data["mortgage"].date.strftime("%Y-%m-%d"),
+        "gas": str(data["gas"].value),
+        "gas_updated": data["gas"].date.strftime("%Y-%m-%d"),
+        "wti": str(data["wti"].value),
+        "wti_updated": data["wti"].date.strftime("%Y-%m-%d"),
+    }
+
+    replaced = False
+    for i, row in enumerate(rows):
+        if row.get("snapshot_date") == today:
+            rows[i] = snapshot
+            replaced = True
+            break
+
+    if not replaced:
+        rows.append(snapshot)
+
+    rows.sort(key=lambda r: r["snapshot_date"])
+    save_history(rows)
+    return rows
+
+
+def parse_float(value: Optional[str]) -> Optional[float]:
+    if value in (None, ""):
         return None
-    return ((new - old) / old) * 100.0
-
-
-def fmt_num(val: float, prefix: str = "", suffix: str = "") -> str:
-    if abs(val) >= 1000:
-        return f"{prefix}{val:,.1f}{suffix}"
-    if abs(val) >= 100:
-        return f"{prefix}{val:,.1f}{suffix}"
-    return f"{prefix}{val:,.2f}{suffix}"
-
-
-def change_text(current: float, previous: Optional[float], prefix: str = "", suffix: str = "") -> str:
-    if previous is None:
-        return "n/a"
-    chg = current - previous
-    pct = pct_change(current, previous)
-    if pct is None:
-        return f"{prefix}{chg:+.2f}{suffix}"
-    return f"{prefix}{chg:+.2f}{suffix} ({pct:+.2f}%)"
-
-
-def safe_fetch(name: str, fetch_func):
     try:
-        return fetch_func(), None
-    except Exception as e:
-        return None, f"{name}: {e}"
+        return float(value)
+    except Exception:
+        return None
 
 
-def build_chart(series_map: dict) -> bytes:
+def build_chart(history_rows: List[Dict[str, str]]) -> bytes:
     plt.figure(figsize=(12, 7))
 
+    metric_keys = ["gdp", "unemployment", "cpi", "mortgage", "gas", "wti"]
     plotted_any = False
-    for label, points in series_map.items():
-        if not points:
-            continue
-        xs = [p.date for p in points[-12:]]
-        ys = [p.value for p in points[-12:]]
-        if xs and ys:
-            plt.plot(xs, ys, marker="o", label=label)
-            plotted_any = True
 
-    if not plotted_any:
-        plt.text(0.5, 0.5, "No chart data available", ha="center", va="center")
-        plt.axis("off")
-    else:
-        plt.title("Economic Data Trends (latest 12 observations)")
-        plt.xlabel("Date")
-        plt.ylabel("Value")
+    # Normalize each series to first available value = 100 so different scales are comparable
+    for key in metric_keys:
+        xs: List[datetime] = []
+        ys: List[float] = []
+
+        for row in history_rows[-90:]:
+            val = parse_float(row.get(key))
+            if val is None:
+                continue
+            try:
+                dt = datetime.strptime(row["snapshot_date"], "%Y-%m-%d")
+            except Exception:
+                continue
+            xs.append(dt)
+            ys.append(val)
+
+        if len(xs) < 2:
+            continue
+
+        base = ys[0]
+        if base == 0:
+            continue
+
+        normalized = [(y / base) * 100.0 for y in ys]
+        label = (
+            FRED_SERIES[key]["name"] if key in FRED_SERIES
+            else DISPLAY_META[key]["name"]
+        )
+
+        plt.plot(xs, normalized, marker="o", label=label)
+        plotted_any = True
+
+    if plotted_any:
+        plt.title("Economic Trends (Normalized, base = 100)")
+        plt.xlabel("Snapshot Date")
+        plt.ylabel("Normalized Index")
         plt.legend()
+    else:
+        plt.text(0.5, 0.5, "Not enough history yet for a trend chart", ha="center", va="center")
+        plt.axis("off")
 
     plt.tight_layout()
     buf = io.BytesIO()
@@ -205,21 +348,35 @@ def build_chart(series_map: dict) -> bytes:
     return buf.read()
 
 
-def discord_payload(rows: List[dict], errors: List[str]) -> dict:
+def build_embed_rows(data: Dict[str, Point]) -> List[Dict[str, str]]:
+    rows = []
+
+    for key in DISPLAY_ORDER:
+        if key == "wti":
+            meta = DISPLAY_META["wti"]
+            point = data["wti"]
+        else:
+            meta = FRED_SERIES[key]
+            point = data[key]
+
+        rows.append({
+            "name": f"{meta['name']} ({meta['cadence']})",
+            "latest_text": fmt_num(point.value, prefix=meta["prefix"], suffix=meta["suffix"]),
+            "updated_text": point.date.strftime("%Y-%m-%d"),
+        })
+
+    return rows
+
+
+def discord_payload(rows: List[Dict[str, str]]) -> dict:
     description_parts = []
 
-    if rows:
-        for item in rows:
-            description_parts.append(
-                f"**{item['name']}**\n"
-                f"Latest: {item['latest_text']}\n"
-                f"Prev: {item['prev_text']}\n"
-                f"Change: {item['change_text']}\n"
-                f"Updated: {item['date_text']}"
-            )
-
-    if errors:
-        description_parts.append("**Warnings**\n" + "\n".join(f"- {e}" for e in errors[:10]))
+    for item in rows:
+        description_parts.append(
+            f"**{item['name']}**\n"
+            f"Latest: {item['latest_text']}\n"
+            f"Updated: {item['updated_text']}"
+        )
 
     description = "\n\n".join(description_parts)[:4096]
     now = datetime.now(timezone.utc).isoformat()
@@ -228,8 +385,10 @@ def discord_payload(rows: List[dict], errors: List[str]) -> dict:
         "embeds": [
             {
                 "title": "Economic Snapshot",
-                "description": description or "No data available.",
-                "footer": {"text": "Sources: FRED + Alpha Vantage"},
+                "description": description,
+                "footer": {
+                    "text": "Bot runs daily • Some metrics update weekly/monthly/quarterly"
+                },
                 "timestamp": now,
                 "image": {"url": "attachment://economic_trends.png"},
             }
@@ -251,80 +410,26 @@ def main() -> int:
     fred_key = require_env("FRED_API_KEY")
     alpha_key = require_env("ALPHAVANTAGE_API_KEY")
 
-    errors: List[str] = []
+    data: Dict[str, Point] = {}
 
-    gdp, err = safe_fetch("Real GDP", lambda: fred_observations(fred_key, SERIES["GDP"]["series_id"], limit=24))
-    if err:
-        errors.append(err)
+    data["gdp"] = fred_latest_observation(fred_key, FRED_SERIES["gdp"]["series_id"])
+    data["unemployment"] = fred_latest_observation(fred_key, FRED_SERIES["unemployment"]["series_id"])
+    data["cpi"] = fred_latest_observation(fred_key, FRED_SERIES["cpi"]["series_id"])
+    data["mortgage"] = fred_latest_observation(fred_key, FRED_SERIES["mortgage"]["series_id"])
+    data["gas"] = fred_latest_observation(fred_key, FRED_SERIES["gas"]["series_id"])
 
-    cpi, err = safe_fetch("CPI", lambda: fred_observations(fred_key, SERIES["CPI"]["series_id"], limit=24))
-    if err:
-        errors.append(err)
+    time.sleep(15)  # helps avoid free-tier Alpha Vantage rate-limit weirdness
+    data["wti"] = alpha_wti_latest(alpha_key)
 
-    unrate, err = safe_fetch("Unemployment", lambda: fred_observations(fred_key, SERIES["UNRATE"]["series_id"], limit=24))
-    if err:
-        errors.append(err)
+    history_rows = upsert_today_snapshot(data)
+    chart = build_chart(history_rows)
+    rows = build_embed_rows(data)
+    payload = discord_payload(rows)
 
-    fedfunds, err = safe_fetch("Fed Funds", lambda: fred_observations(fred_key, SERIES["FEDFUNDS"]["series_id"], limit=24))
-    if err:
-        errors.append(err)
-
-    wti, err = safe_fetch("WTI Oil", lambda: alpha_commodity(alpha_key, "WTI", interval="monthly"))
-    if err:
-        errors.append(err)
-
-    time.sleep(15)
-
-    brent, err = safe_fetch("Brent Oil", lambda: alpha_commodity(alpha_key, "BRENT", interval="monthly"))
-    if err:
-        errors.append(err)
-
-    rows = []
-
-    for name, points, prefix, suffix in [
-        ("Real GDP", gdp, "", ""),
-        ("CPI", cpi, "", ""),
-        ("Unemployment", unrate, "", "%"),
-        ("Fed Funds", fedfunds, "", "%"),
-        ("WTI Oil", wti, "$", ""),
-        ("Brent Oil", brent, "$", ""),
-    ]:
-        if not points:
-            continue
-
-        latest, prev = latest_and_prev(points)
-        rows.append(
-            {
-                "name": name,
-                "latest_text": fmt_num(latest.value, prefix=prefix, suffix=suffix),
-                "prev_text": fmt_num(prev.value, prefix=prefix, suffix=suffix) if prev else "n/a",
-                "change_text": change_text(latest.value, prev.value if prev else None, prefix=prefix, suffix=suffix),
-                "date_text": latest.date.strftime("%Y-%m-%d"),
-            }
-        )
-
-    if not rows and errors:
-        raise RuntimeError("All data sources failed:\n" + "\n".join(errors))
-
-    chart = build_chart(
-        {
-            "Real GDP": gdp,
-            "CPI": cpi,
-            "Unemployment": unrate,
-            "Fed Funds": fedfunds,
-            "WTI": wti,
-            "Brent": brent,
-        }
-    )
-
-    payload = discord_payload(rows, errors)
     post_to_discord(webhook, payload, chart)
 
     print("Posted economic snapshot to Discord.")
-    if errors:
-        print("Completed with warnings:")
-        for e in errors:
-            print("-", e)
+    print(f"History rows stored: {len(history_rows)}")
 
     return 0
 
