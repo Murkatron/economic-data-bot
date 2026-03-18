@@ -1,2 +1,2 @@
-snapshot_date,gdp,gdp_updated,unemployment,unemployment_updated,cpi,cpi_updated,mortgage,mortgage_updated,gas,gas_updated,wti,wti_updated
-2026-03-18,24065.956,2025-10-01,4.4,2026-02-01,327.46,2026-02-01,6.11,2026-03-12,3.72,2026-03-16,94.65,2026-03-09
+snapshot_date,gdp,unemployment,cpi,fedfunds,ust10y,sentiment,mortgage,gas,wti,brent,sp500,debt,gdp_updated,unemployment_updated,cpi_updated,fedfunds_updated,ust10y_updated,sentiment_updated,mortgage_updated,gas_updated,wti_updated,brent_updated,sp500_updated,debt_updated
+2026-03-18,24065.956,4.4,327.46,3.64,4.13,56.4,6.11,3.72,94.65,94.35,6716.09,38514009.0,2025-10-01,2026-02-01,2026-02-01,2026-02-01,2026-02-01,2026-01-01,2026-03-12,2026-03-16,2026-03-09,2026-03-09,2026-03-17,2025-10-01
