@@ -1,29 +1,7 @@
 #!/usr/bin/env python3
-"""
-Simple Economic Data Discord Webhook Poster
-
-Tracks:
-- Real GDP (Quarterly)            -> FRED GDPC1
-- Unemployment (Monthly)          -> FRED UNRATE
-- Inflation / CPI (Monthly)       -> FRED CPIAUCSL
-- Mortgage Rate (Weekly)          -> FRED MORTGAGE30US
-- Gas Price (Weekly)              -> FRED GASREGW
-- WTI Oil (Daily-ish market data) -> Alpha Vantage WTI commodity endpoint
-
-What it does:
-1. Fetch latest values
-2. Save one snapshot per day into history.csv
-3. Build a trend chart from that saved history
-4. Post an embed + chart to Discord webhook
-
-Environment variables:
-    DISCORD_WEBHOOK_URL=...
-    FRED_API_KEY=...
-    ALPHAVANTAGE_API_KEY=...
-"""
-
 from __future__ import annotations
 
+import base64
 import csv
 import io
 import json
@@ -31,7 +9,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import requests
@@ -79,8 +57,6 @@ FRED_SERIES = {
     },
 }
 
-DISPLAY_ORDER = ["gdp", "unemployment", "cpi", "mortgage", "gas", "wti"]
-
 DISPLAY_META = {
     "wti": {
         "name": "WTI Oil",
@@ -89,6 +65,26 @@ DISPLAY_META = {
         "suffix": "",
     }
 }
+
+FIELDNAMES = [
+    "snapshot_date",
+    "gdp",
+    "gdp_updated",
+    "unemployment",
+    "unemployment_updated",
+    "cpi",
+    "cpi_updated",
+    "mortgage",
+    "mortgage_updated",
+    "gas",
+    "gas_updated",
+    "wti",
+    "wti_updated",
+]
+
+MACRO_KEYS = ["gdp", "unemployment", "cpi"]
+COST_KEYS = ["mortgage", "gas", "wti"]
+DISPLAY_ORDER = ["gdp", "unemployment", "cpi", "mortgage", "gas", "wti"]
 
 
 @dataclass
@@ -104,6 +100,10 @@ def require_env(name: str) -> str:
     return value
 
 
+def optional_env(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
+
+
 def fmt_num(val: Optional[float], prefix: str = "", suffix: str = "") -> str:
     if val is None:
         return "n/a"
@@ -112,6 +112,22 @@ def fmt_num(val: Optional[float], prefix: str = "", suffix: str = "") -> str:
     if abs(val) >= 100:
         return f"{prefix}{val:,.1f}{suffix}"
     return f"{prefix}{val:,.2f}{suffix}"
+
+
+def pct_change(new: float, old: float) -> Optional[float]:
+    if old == 0:
+        return None
+    return ((new - old) / old) * 100.0
+
+
+def trend_arrow(delta: Optional[float]) -> str:
+    if delta is None:
+        return "➡️"
+    if delta > 0:
+        return "📈"
+    if delta < 0:
+        return "📉"
+    return "➡️"
 
 
 def fred_latest_observation(api_key: str, series_id: str) -> Point:
@@ -191,66 +207,74 @@ def alpha_wti_latest(api_key: str) -> Point:
     raise RuntimeError(f"Alpha Vantage WTI failed: {last_error}")
 
 
-def ensure_history_file() -> None:
-    if os.path.exists(HISTORY_FILE):
-        return
-
-    with open(HISTORY_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "snapshot_date",
-            "gdp",
-            "gdp_updated",
-            "unemployment",
-            "unemployment_updated",
-            "cpi",
-            "cpi_updated",
-            "mortgage",
-            "mortgage_updated",
-            "gas",
-            "gas_updated",
-            "wti",
-            "wti_updated",
-        ])
+def github_headers(token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+    }
 
 
-def load_history() -> List[Dict[str, str]]:
-    ensure_history_file()
+def fetch_history_from_github(repo: str, branch: str, token: str) -> List[Dict[str, str]]:
+    url = f"https://api.github.com/repos/{repo}/contents/{HISTORY_FILE}"
+    params = {"ref": branch}
+
+    r = requests.get(url, headers=github_headers(token), params=params, timeout=TIMEOUT)
+
+    if r.status_code == 404:
+        return []
+
+    r.raise_for_status()
+    payload = r.json()
+    content = payload.get("content", "")
+    decoded = base64.b64decode(content).decode("utf-8")
+
     rows: List[Dict[str, str]] = []
-
-    with open(HISTORY_FILE, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(row)
-
+    reader = csv.DictReader(io.StringIO(decoded))
+    for row in reader:
+        rows.append(row)
     return rows
 
 
-def save_history(rows: List[Dict[str, str]]) -> None:
-    fieldnames = [
-        "snapshot_date",
-        "gdp",
-        "gdp_updated",
-        "unemployment",
-        "unemployment_updated",
-        "cpi",
-        "cpi_updated",
-        "mortgage",
-        "mortgage_updated",
-        "gas",
-        "gas_updated",
-        "wti",
-        "wti_updated",
-    ]
+def push_history_to_github(repo: str, branch: str, token: str, rows: List[Dict[str, str]]) -> None:
+    existing_sha = None
+    get_url = f"https://api.github.com/repos/{repo}/contents/{HISTORY_FILE}"
+    params = {"ref": branch}
 
-    with open(HISTORY_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+    existing = requests.get(get_url, headers=github_headers(token), params=params, timeout=TIMEOUT)
+    if existing.status_code == 200:
+        existing_sha = existing.json().get("sha")
+    elif existing.status_code != 404:
+        existing.raise_for_status()
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=FIELDNAMES)
+    writer.writeheader()
+    writer.writerows(rows)
+    raw_csv = buf.getvalue()
+
+    payload = {
+        "message": f"Update economic history for {date.today().isoformat()}",
+        "content": base64.b64encode(raw_csv.encode("utf-8")).decode("utf-8"),
+        "branch": branch,
+    }
+    if existing_sha:
+        payload["sha"] = existing_sha
+
+    put_url = f"https://api.github.com/repos/{repo}/contents/{HISTORY_FILE}"
+    r = requests.put(put_url, headers=github_headers(token), json=payload, timeout=TIMEOUT)
+    r.raise_for_status()
 
 
-def upsert_today_snapshot(data: Dict[str, Point]) -> List[Dict[str, str]]:
-    rows = load_history()
+def parse_float(value: Optional[str]) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def upsert_today_snapshot(rows: List[Dict[str, str]], data: Dict[str, Point]) -> List[Dict[str, str]]:
     today = date.today().isoformat()
 
     snapshot = {
@@ -280,61 +304,52 @@ def upsert_today_snapshot(data: Dict[str, Point]) -> List[Dict[str, str]]:
         rows.append(snapshot)
 
     rows.sort(key=lambda r: r["snapshot_date"])
-    save_history(rows)
     return rows
 
 
-def parse_float(value: Optional[str]) -> Optional[float]:
-    if value in (None, ""):
-        return None
-    try:
-        return float(value)
-    except Exception:
-        return None
+def normalized_series(history_rows: List[Dict[str, str]], key: str, limit: int = 90) -> Tuple[List[datetime], List[float]]:
+    xs: List[datetime] = []
+    ys: List[float] = []
+
+    for row in history_rows[-limit:]:
+        val = parse_float(row.get(key))
+        if val is None:
+            continue
+        try:
+            dt = datetime.strptime(row["snapshot_date"], "%Y-%m-%d")
+        except Exception:
+            continue
+        xs.append(dt)
+        ys.append(val)
+
+    if len(xs) < 2:
+        return [], []
+
+    base = ys[0]
+    if base == 0:
+        return [], []
+
+    normalized = [(y / base) * 100.0 for y in ys]
+    return xs, normalized
 
 
-def build_chart(history_rows: List[Dict[str, str]]) -> bytes:
+def make_chart(history_rows: List[Dict[str, str]], keys: List[str], title: str) -> bytes:
     plt.figure(figsize=(12, 7))
-
-    metric_keys = ["gdp", "unemployment", "cpi", "mortgage", "gas", "wti"]
     plotted_any = False
 
-    # Normalize each series to first available value = 100 so different scales are comparable
-    for key in metric_keys:
-        xs: List[datetime] = []
-        ys: List[float] = []
-
-        for row in history_rows[-90:]:
-            val = parse_float(row.get(key))
-            if val is None:
-                continue
-            try:
-                dt = datetime.strptime(row["snapshot_date"], "%Y-%m-%d")
-            except Exception:
-                continue
-            xs.append(dt)
-            ys.append(val)
-
-        if len(xs) < 2:
+    for key in keys:
+        xs, ys = normalized_series(history_rows, key)
+        if not xs or not ys:
             continue
 
-        base = ys[0]
-        if base == 0:
-            continue
-
-        normalized = [(y / base) * 100.0 for y in ys]
-        label = (
-            FRED_SERIES[key]["name"] if key in FRED_SERIES
-            else DISPLAY_META[key]["name"]
-        )
-
-        plt.plot(xs, normalized, marker="o", label=label)
+        label = FRED_SERIES[key]["name"] if key in FRED_SERIES else DISPLAY_META[key]["name"]
+        plt.plot(xs, ys, marker="o", label=label)
         plotted_any = True
 
     if plotted_any:
-        plt.title("Economic Trends (Normalized, base = 100)")
+        plt.title(title)
         plt.xlabel("Snapshot Date")
-        plt.ylabel("Normalized Index")
+        plt.ylabel("Normalized Index (base = 100)")
         plt.legend()
     else:
         plt.text(0.5, 0.5, "Not enough history yet for a trend chart", ha="center", va="center")
@@ -348,67 +363,110 @@ def build_chart(history_rows: List[Dict[str, str]]) -> bytes:
     return buf.read()
 
 
-def build_embed_rows(data: Dict[str, Point]) -> List[Dict[str, str]]:
+def latest_change_from_history(history_rows: List[Dict[str, str]], key: str) -> Tuple[Optional[float], Optional[float]]:
+    vals = []
+    for row in history_rows[-8:]:
+        val = parse_float(row.get(key))
+        if val is not None:
+            vals.append(val)
+
+    if not vals:
+        return None, None
+    if len(vals) == 1:
+        return vals[-1], None
+    return vals[-1], vals[-1] - vals[-2]
+
+
+def metric_meta(key: str) -> dict:
+    if key in FRED_SERIES:
+        return FRED_SERIES[key]
+    return DISPLAY_META[key]
+
+
+def build_embed_rows(data: Dict[str, Point], history_rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
     rows = []
 
     for key in DISPLAY_ORDER:
-        if key == "wti":
-            meta = DISPLAY_META["wti"]
-            point = data["wti"]
-        else:
-            meta = FRED_SERIES[key]
-            point = data[key]
+        meta = metric_meta(key)
+        point = data[key]
+
+        _, delta = latest_change_from_history(history_rows, key)
+        arrow = trend_arrow(delta)
+
+        delta_text = "n/a"
+        if delta is not None:
+            delta_text = f"{arrow} {fmt_num(delta, prefix=meta['prefix'], suffix=meta['suffix'])}"
 
         rows.append({
             "name": f"{meta['name']} ({meta['cadence']})",
             "latest_text": fmt_num(point.value, prefix=meta["prefix"], suffix=meta["suffix"]),
             "updated_text": point.date.strftime("%Y-%m-%d"),
+            "trend_text": delta_text,
         })
 
     return rows
 
 
-def discord_payload(rows: List[Dict[str, str]]) -> dict:
-    description_parts = []
+def build_summary(history_rows: List[Dict[str, str]]) -> str:
+    bits = []
 
-    for item in rows:
-        description_parts.append(
-            f"**{item['name']}**\n"
-            f"Latest: {item['latest_text']}\n"
-            f"Updated: {item['updated_text']}"
-        )
+    for key in ["wti", "gas", "mortgage", "unemployment"]:
+        meta = metric_meta(key)
+        latest, delta = latest_change_from_history(history_rows, key)
+        if latest is None:
+            continue
 
-    description = "\n\n".join(description_parts)[:4096]
-    now = datetime.now(timezone.utc).isoformat()
+        arrow = trend_arrow(delta)
+        if delta is None or delta == 0:
+            bits.append(f"{meta['name']} {arrow} flat")
+        else:
+            bits.append(f"{meta['name']} {arrow} {fmt_num(abs(delta), prefix=meta['prefix'], suffix=meta['suffix'])}")
 
-    return {
-        "embeds": [
-            {
-                "title": "Economic Snapshot",
-                "description": description,
-                "footer": {
-                    "text": "Bot runs daily • Some metrics update weekly/monthly/quarterly"
-                },
-                "timestamp": now,
-                "image": {"url": "attachment://economic_trends.png"},
-            }
-        ]
-    }
+    return " • ".join(bits[:4]) if bits else "Daily update posted."
 
 
-def post_to_discord(webhook_url: str, payload: dict, image_bytes: bytes) -> None:
+def post_to_discord_single(webhook_url: str, payload: dict, image_bytes: bytes, filename: str) -> None:
     files = {
-        "file": ("economic_trends.png", image_bytes, "image/png"),
+        "file": (filename, image_bytes, "image/png"),
         "payload_json": (None, json.dumps(payload), "application/json"),
     }
     r = requests.post(webhook_url, files=files, timeout=TIMEOUT)
     r.raise_for_status()
 
 
+def discord_payload(rows: List[Dict[str, str]], summary: str, title: str, image_name: str) -> dict:
+    description_parts = [f"**Summary**\n{summary}"]
+
+    for item in rows:
+        description_parts.append(
+            f"**{item['name']}**\n"
+            f"Latest: {item['latest_text']}\n"
+            f"Trend: {item['trend_text']}\n"
+            f"Updated: {item['updated_text']}"
+        )
+
+    return {
+        "embeds": [
+            {
+                "title": title,
+                "description": "\n\n".join(description_parts)[:4096],
+                "footer": {
+                    "text": "Bot runs daily • Metrics update on their own cadence"
+                },
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "image": {"url": f"attachment://{image_name}"},
+            }
+        ]
+    }
+
+
 def main() -> int:
     webhook = require_env("DISCORD_WEBHOOK_URL")
     fred_key = require_env("FRED_API_KEY")
     alpha_key = require_env("ALPHAVANTAGE_API_KEY")
+    github_token = require_env("GITHUB_TOKEN")
+    github_repo = require_env("GITHUB_REPO")
+    github_branch = optional_env("GITHUB_BRANCH", "main")
 
     data: Dict[str, Point] = {}
 
@@ -418,18 +476,27 @@ def main() -> int:
     data["mortgage"] = fred_latest_observation(fred_key, FRED_SERIES["mortgage"]["series_id"])
     data["gas"] = fred_latest_observation(fred_key, FRED_SERIES["gas"]["series_id"])
 
-    time.sleep(15)  # helps avoid free-tier Alpha Vantage rate-limit weirdness
+    time.sleep(15)
     data["wti"] = alpha_wti_latest(alpha_key)
 
-    history_rows = upsert_today_snapshot(data)
-    chart = build_chart(history_rows)
-    rows = build_embed_rows(data)
-    payload = discord_payload(rows)
+    history_rows = fetch_history_from_github(github_repo, github_branch, github_token)
+    history_rows = upsert_today_snapshot(history_rows, data)
+    push_history_to_github(github_repo, github_branch, github_token, history_rows)
 
-    post_to_discord(webhook, payload, chart)
+    rows = build_embed_rows(data, history_rows)
+    summary = build_summary(history_rows)
+
+    macro_chart = make_chart(history_rows, MACRO_KEYS, "Macro Trends (Normalized, base = 100)")
+    cost_chart = make_chart(history_rows, COST_KEYS, "Cost Trends (Normalized, base = 100)")
+
+    macro_payload = discord_payload(rows[:3], summary, "Economic Snapshot — Macro", "macro_trends.png")
+    cost_payload = discord_payload(rows[3:], summary, "Economic Snapshot — Costs", "cost_trends.png")
+
+    post_to_discord_single(webhook, macro_payload, macro_chart, "macro_trends.png")
+    post_to_discord_single(webhook, cost_payload, cost_chart, "cost_trends.png")
 
     print("Posted economic snapshot to Discord.")
-    print(f"History rows stored: {len(history_rows)}")
+    print(f"History rows stored in GitHub: {len(history_rows)}")
 
     return 0
 
